@@ -66,19 +66,18 @@ async fn run() {
     println!("Reset the target");
     let mut buffer = [0u8; 1];
 
-    loop {
-        match port.read(&mut buffer).await {
-            Ok(_len) => {
-                if buffer[0] == 0xff {
-                    break;
-                }
-            }
-            Err(_) => (),
-        }
-    }
+    //loop {
+    //    match port.read(&mut buffer).await {
+    //        Ok(_len) => {
+    //            if buffer[0] == 0xff {
+    //                break;
+    //            }
+    //        }
+    //        Err(_) => (),
+    //    }
+    //}
 
     println!("Connected");
-    println!("Q to exit, N to notify, X force disconnect");
 
     let controller = SerialController::new(port);
     static HOST_RESOURCES: StaticCell<HostResources<NoopRawMutex, 4, 32, 27>> = StaticCell::new();
