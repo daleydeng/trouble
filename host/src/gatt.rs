@@ -8,9 +8,11 @@ use crate::connection_manager::DynamicConnectionManager;
 use crate::cursor::WriteCursor;
 use crate::packet_pool::{AllocId, DynamicPacketPool};
 use crate::pdu::Pdu;
+use crate::types::uuid::Uuid;
 use bt_hci::param::ConnHandle;
 use embassy_sync::blocking_mutex::raw::RawMutex;
 use embassy_sync::channel::{DynamicReceiver, DynamicSender};
+use heapless::Vec;
 
 pub struct GattServer<'reference, 'values, 'resources, M: RawMutex, const MAX: usize> {
     pub(crate) server: AttributeServer<'reference, 'values, M, MAX>,
@@ -144,5 +146,58 @@ impl<'reference, 'values> fmt::Debug for GattEvent<'reference, 'values> {
 impl<'reference, 'values> defmt::Format for GattEvent<'reference, 'values> {
     fn format(&self, fmt: defmt::Formatter) {
         defmt::write!(fmt, "{}", defmt::Debug2Format(self))
+    }
+}
+
+pub struct GattClient<'reference, 'resources> {
+    pub(crate) tx: DynamicSender<'reference, (ConnHandle, Pdu<'resources>)>,
+    pub(crate) rx: DynamicReceiver<'reference, (ConnHandle, Pdu<'resources>)>,
+    pub(crate) pool_id: AllocId,
+    pub(crate) pool: &'resources dyn DynamicPacketPool<'resources>,
+}
+
+impl<'reference, 'resources> GattClient<'reference, 'resources> {
+    /// Discover a schema of handles/attributes
+    pub async fn service<const MAX: usize>(&mut self) -> Result<ServiceClient<MAX>, ()> {
+        todo!()
+    }
+
+    async fn send(&self, data: Att<'_>) -> Result<(), ()> {
+        todo!()
+    }
+
+    async fn receive(&self, data: Att<'_>) -> Result<(), ()> {
+        todo!()
+    }
+}
+
+pub struct ServiceClient<'reference, 'resources, const MAX: usize> {
+    gatt: &'reference GattClient<'reference, 'resources>,
+    characteristics: Vec<(Uuid, CharacteristicHandle), MAX>,
+}
+
+pub struct CharacteristicClient<'reference, 'resources> {
+    gatt: &'reference GattClient<'reference, 'resources>,
+    handle: CharacteristicHandle,
+    uuid: Uuid,
+}
+
+impl<'reference, 'resources, const MAX: usize> ServiceClient<'reference, 'resources, MAX> {
+    pub async fn characteristic(&mut self, uuid: Uuid) -> Result<CharacteristicClient<'reference, 'resources>, ()> {
+        todo!()
+    }
+}
+
+impl<'reference, 'resources> CharacteristicClient<'reference, 'resources> {
+    pub async fn write(&mut self, data: &[u8]) -> Result<(), ()> {
+        todo!()
+    }
+
+    pub async fn read(&mut self, handle: CharacteristicHandle, data: &mut [u8]) -> Result<(), ()> {
+        todo!()
+    }
+
+    pub async fn subscribe(&mut self, handle: CharacteristicHandle) -> Result<(), ()> {
+        todo!()
     }
 }
