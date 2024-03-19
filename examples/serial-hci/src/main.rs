@@ -168,6 +168,11 @@ where
     pub fn new(io: T) -> Self {
         Self { io: Mutex::new(io) }
     }
+
+    pub async fn run(&self) -> ! {
+        let (mut reader, mut writer) =
+    }
+
 }
 
 impl<T> Controller for SerialController<T>

@@ -1,3 +1,5 @@
+use core::future::poll_fn;
+
 use crate::advertise::AdvertiseConfig;
 use crate::attribute::AttributeTable;
 use crate::attribute_server::AttributeServer;
@@ -17,13 +19,12 @@ use bt_hci::cmd::le::{
     LeCreateConn, LeCreateConnParams, LeSetAdvData, LeSetAdvEnable, LeSetAdvParams, LeSetScanEnable, LeSetScanParams,
 };
 use bt_hci::cmd::link_control::{Disconnect, DisconnectParams};
-use bt_hci::cmd::{AsyncCmd, SyncCmd};
+use bt_hci::cmd::{AsyncCmd, Cmd, SyncCmd};
 use bt_hci::data::{AclBroadcastFlag, AclPacket, AclPacketBoundary};
 use bt_hci::event::le::LeEvent;
 use bt_hci::event::Event;
 use bt_hci::param::{BdAddr, ConnHandle, DisconnectReason, EventMask};
-use bt_hci::{Controller, ControllerToHostPacket};
-use bt_hci::{ControllerCmdAsync, ControllerCmdSync};
+use bt_hci::{Driver, FromHciBytes, PacketKind, WriteHci};
 use embassy_futures::select::{select4, Either4};
 use embassy_sync::blocking_mutex::raw::RawMutex;
 use embassy_sync::channel::Channel;
@@ -53,7 +54,7 @@ pub struct Adapter<
 > where
     M: RawMutex,
 {
-    pub(crate) controller: T,
+    driver: RefCell<T>,
     pub(crate) connections: ConnectionManager<M, CONNS>,
     pub(crate) channels: ChannelManager<'d, M, CHANNELS, L2CAP_TXQ, L2CAP_RXQ>,
     pub(crate) att_inbound: Channel<M, (ConnHandle, Pdu<'d>), L2CAP_RXQ>,
@@ -86,7 +87,7 @@ impl<'d, M, T, const CONNS: usize, const CHANNELS: usize, const L2CAP_TXQ: usize
     Adapter<'d, M, T, CONNS, CHANNELS, L2CAP_TXQ, L2CAP_RXQ>
 where
     M: RawMutex,
-    T: Controller,
+    T: Driver,
 {
     const NEW_L2CAP: Channel<M, Pdu<'d>, L2CAP_RXQ> = Channel::new();
 
@@ -95,11 +96,11 @@ where
     /// The adapter requires a HCI driver (a particular HCI-compatible controller implementing the required traits), and
     /// a reference to resources that are created outside the adapter but which the adapter is the only accessor of.
     pub fn new<const PACKETS: usize, const L2CAP_MTU: usize>(
-        controller: T,
+        driver: T,
         host_resources: &'d mut HostResources<M, CHANNELS, PACKETS, L2CAP_MTU>,
     ) -> Self {
         Self {
-            controller,
+            driver: RefCell::new(driver),
             connections: ConnectionManager::new(),
             channels: ChannelManager::new(&host_resources.pool),
             pool: &host_resources.pool,
@@ -114,59 +115,57 @@ where
     /// Performs a BLE scan, return a report for discovering peripherals.
     ///
     /// Scan is stopped when a report is received. Call this method repeatedly to continue scanning.
-    pub async fn scan(&self, config: &ScanConfig) -> Result<ScanReport, Error<T::Error>>
-    where
-        T: ControllerCmdSync<LeSetScanEnable> + ControllerCmdSync<LeSetScanParams>,
-    {
-        let params = config.params.unwrap_or(LeSetScanParams::new(
-            bt_hci::param::LeScanKind::Passive,
-            bt_hci::param::Duration::from_millis(1_000),
-            bt_hci::param::Duration::from_millis(1_000),
-            bt_hci::param::AddrKind::PUBLIC,
-            bt_hci::param::ScanningFilterPolicy::BasicUnfiltered,
-        ));
-        params.exec(&self.controller).await?;
+    pub async fn scan(&self, config: &ScanConfig) -> Result<ScanReport, Error<T::Error>> {
+        //let mut tx = [0; 259];
+        //let mut rx = [0; 259];
+        //let params = config.params.unwrap_or(LeSetScanParams::new(
+        //    bt_hci::param::LeScanKind::Passive,
+        //    bt_hci::param::Duration::from_millis(1_000),
+        //    bt_hci::param::Duration::from_millis(1_000),
+        //    bt_hci::param::AddrKind::PUBLIC,
+        //    bt_hci::param::ScanningFilterPolicy::BasicUnfiltered,
+        //));
+        //params.exec(&self.controller).await?;
 
-        LeSetScanEnable::new(true, true).exec(&self.controller).await?;
+        //LeSetScanEnable::new(true, true).exec(&self.controller).await?;
 
-        let report = self.scanner.receive().await;
-        LeSetScanEnable::new(false, false).exec(&self.controller).await?;
-        Ok(report)
+        //let report = self.scanner.receive().await;
+        //LeSetScanEnable::new(false, false).exec(&self.controller).await?;
+        //Ok(report)
+        todo!()
     }
 
     /// Starts sending BLE advertisements according to the provided config.
     ///
     /// Advertisements are stopped when a connection is made against this host,
     /// in which case a handle for the connection is returned.
-    pub async fn advertise<'m>(&'m self, config: &AdvertiseConfig<'_>) -> Result<Connection<'m>, Error<T::Error>>
-    where
-        T: ControllerCmdSync<LeSetAdvData> + ControllerCmdSync<LeSetAdvEnable> + ControllerCmdSync<LeSetAdvParams>,
-    {
-        let params = &config.params.unwrap_or(LeSetAdvParams::new(
-            bt_hci::param::Duration::from_millis(400),
-            bt_hci::param::Duration::from_millis(400),
-            bt_hci::param::AdvKind::AdvInd,
-            bt_hci::param::AddrKind::PUBLIC,
-            bt_hci::param::AddrKind::PUBLIC,
-            BdAddr::default(),
-            bt_hci::param::AdvChannelMap::ALL,
-            bt_hci::param::AdvFilterPolicy::default(),
-        ));
+    pub async fn advertise<'m>(&'m self, config: &AdvertiseConfig<'_>) -> Result<Connection<'m>, Error<T::Error>> {
+        //let params = &config.params.unwrap_or(LeSetAdvParams::new(
+        //    bt_hci::param::Duration::from_millis(400),
+        //    bt_hci::param::Duration::from_millis(400),
+        //    bt_hci::param::AdvKind::AdvInd,
+        //    bt_hci::param::AddrKind::PUBLIC,
+        //    bt_hci::param::AddrKind::PUBLIC,
+        //    BdAddr::default(),
+        //    bt_hci::param::AdvChannelMap::ALL,
+        //    bt_hci::param::AdvFilterPolicy::default(),
+        //));
 
-        params.exec(&self.controller).await?;
+        //params.exec(&self.controller).await?;
 
-        let mut data = [0; 31];
-        let mut w = WriteCursor::new(&mut data[..]);
-        for item in config.data.iter() {
-            item.encode(&mut w)?;
-        }
-        let len = w.len();
-        drop(w);
-        LeSetAdvData::new(len as u8, data).exec(&self.controller).await?;
-        LeSetAdvEnable::new(true).exec(&self.controller).await?;
-        let conn = Connection::accept(self).await;
-        LeSetAdvEnable::new(false).exec(&self.controller).await?;
-        Ok(conn)
+        //let mut data = [0; 31];
+        //let mut w = WriteCursor::new(&mut data[..]);
+        //for item in config.data.iter() {
+        //    item.encode(&mut w)?;
+        //}
+        //let len = w.len();
+        //drop(w);
+        //LeSetAdvData::new(len as u8, data).exec(&self.controller).await?;
+        //LeSetAdvEnable::new(true).exec(&self.controller).await?;
+        //let conn = Connection::accept(self).await;
+        //LeSetAdvEnable::new(false).exec(&self.controller).await?;
+        //Ok(conn)
+        todo!()
     }
 
     /// Creates a GATT server capable of processing the GATT protocol using the provided table of attributes.
@@ -229,13 +228,9 @@ where
         Ok(())
     }
 
-    pub async fn run(&self) -> Result<(), Error<T::Error>>
-    where
-        T: ControllerCmdSync<Disconnect>
-            + ControllerCmdSync<SetEventMask>
-            + ControllerCmdAsync<LeCreateConn>
-            + ControllerCmdSync<LeSetScanEnable>,
-    {
+    async fn write_command<C: Cmd>(&self, command: C, tx: &mut [u8]) -> Result<(), Error<T::Error>> {}
+
+    pub async fn run(&self) -> Result<(), Error<T::Error>> {
         SetEventMask::new(
             EventMask::new()
                 .enable_le_meta(true)
@@ -252,70 +247,86 @@ where
             let mut tx = [0u8; 259];
             // info!("Entering select");
             match select4(
-                self.controller.read(&mut rx),
+                poll_fn(|cx| {
+                    let mut c = self.driver.borrow_mut();
+                    match c.try_read(&mut rx) {
+                        Ok(None) => {
+                            c.register_read_waker(cx.waker());
+                            Poll::Pending
+                        }
+                        Ok(Some(kind)) => Poll::Ready(Ok(kind)),
+                        Err(e) => Poll::Ready(Err(e)),
+                    }
+                }),
                 self.outbound.receive(),
                 self.control.receive(),
                 self.channels.signal(),
             )
             .await
             {
-                Either4::First(result) => {
+                Either4::First(kind) => {
                     // info!("Incoming event");
-                    match result {
-                        Ok(ControllerToHostPacket::Acl(acl)) => match self.handle_acl(acl).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                info!("Error processing ACL packet: {:?}", e);
-                            }
-                        },
-                        Ok(ControllerToHostPacket::Event(event)) => match event {
-                            Event::Le(event) => match event {
-                                LeEvent::LeConnectionComplete(e) => {
-                                    if let Err(err) = self.connections.connect(
-                                        e.handle,
-                                        ConnectionInfo {
-                                            handle: e.handle,
-                                            status: e.status,
-                                            role: e.role,
-                                            peer_address: e.peer_addr,
-                                            interval: e.conn_interval.as_u16(),
-                                            latency: e.peripheral_latency,
-                                            timeout: e.supervision_timeout.as_u16(),
-                                            att_mtu: 23,
-                                        },
-                                    ) {
-                                        warn!("Error establishing connection: {:?}", err);
-                                        Disconnect::new(
-                                            e.handle,
-                                            DisconnectReason::RemoteDeviceTerminatedConnLowResources,
-                                        )
-                                        .exec(&self.controller)
-                                        .await
-                                        .unwrap();
-                                    }
+                    match kind {
+                        Ok(PacketKind::AclData) => {
+                            let acl = AclPacket::from_hci_bytes(&rx)?;
+                            match self.handle_acl(acl).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    info!("Error processing ACL packet: {:?}", e);
                                 }
-                                LeEvent::LeAdvertisingReport(data) => {
-                                    self.scanner
-                                        .send(ScanReport::new(data.reports.num_reports, &data.reports.bytes))
-                                        .await;
+                            }
+                        }
+                        Ok(PacketKind::Event) => {
+                            let event = Event::from_hci_bytes(&rx)?;
+                            match event {
+                                Event::Le(event) => match event {
+                                    LeEvent::LeConnectionComplete(e) => {
+                                        if let Err(err) = self.connections.connect(
+                                            e.handle,
+                                            ConnectionInfo {
+                                                handle: e.handle,
+                                                status: e.status,
+                                                role: e.role,
+                                                peer_address: e.peer_addr,
+                                                interval: e.conn_interval.as_u16(),
+                                                latency: e.peripheral_latency,
+                                                timeout: e.supervision_timeout.as_u16(),
+                                                att_mtu: 23,
+                                            },
+                                        ) {
+                                            warn!("Error establishing connection: {:?}", err);
+                                            Disconnect::new(
+                                                e.handle,
+                                                DisconnectReason::RemoteDeviceTerminatedConnLowResources,
+                                            )
+                                            .exec(&self.controller)
+                                            .await
+                                            .unwrap();
+                                        }
+                                    }
+                                    LeEvent::LeAdvertisingReport(data) => {
+                                        self.scanner
+                                            .send(ScanReport::new(data.reports.num_reports, &data.reports.bytes))
+                                            .await;
+                                    }
+                                    _ => {
+                                        warn!("Unknown event: {:?}", event);
+                                    }
+                                },
+                                Event::DisconnectionComplete(e) => {
+                                    info!("Disconnected: {:?}", e);
+                                    let _ = self.connections.disconnect(e.handle);
+                                }
+                                Event::NumberOfCompletedPackets(c) => {
+                                    //info!("Confirmed {} packets sent", c.completed_packets.len());
                                 }
                                 _ => {
                                     warn!("Unknown event: {:?}", event);
                                 }
-                            },
-                            Event::DisconnectionComplete(e) => {
-                                info!("Disconnected: {:?}", e);
-                                let _ = self.connections.disconnect(e.handle);
                             }
-                            Event::NumberOfCompletedPackets(c) => {
-                                //info!("Confirmed {} packets sent", c.completed_packets.len());
-                            }
-                            _ => {
-                                warn!("Unknown event: {:?}", event);
-                            }
-                        },
-                        Ok(p) => {
-                            info!("Ignoring packet: {:?}", p);
+                        }
+                        Ok(kind) => {
+                            info!("Ignoring packet with kind: {:?}", p);
                         }
                         Err(e) => {
                             info!("Error from controller: {:?}", e);
@@ -325,7 +336,21 @@ where
                 Either4::Second((handle, pdu)) => {
                     // info!("Outgoing packet");
                     let acl = AclPacket::new(handle, pdu.pb, AclBroadcastFlag::PointToPoint, pdu.as_ref());
-                    match self.controller.write_acl_data(&acl).await {
+                    let len = acl.size();
+                    acl.write_hci(&mut tx)?;
+                    match poll_fn(|cx| {
+                        let mut c = self.driver.borrow_mut();
+                        match c.try_write(&tx[..len]) {
+                            Ok(None) => {
+                                c.register_write_waker(cx.waker());
+                                Poll::Pending
+                            }
+                            Ok(Some(_)) => Poll::Ready(Ok(())),
+                            Err(e) => Poll::Ready(Err(e)),
+                        }
+                    })
+                    .await
+                    {
                         Ok(_) => {}
                         Err(e) => {
                             warn!("Error writing some ACL data to controller: {:?}", e);
