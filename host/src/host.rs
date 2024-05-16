@@ -30,7 +30,7 @@ use embassy_sync::once_lock::OnceLock;
 use futures::pin_mut;
 
 use crate::advertise::{Advertisement, AdvertisementConfig, RawAdvertisement};
-use crate::channel_manager::{ChannelManager, ChannelStorage, RxChannel, RX_CHANNEL};
+use crate::channel_manager::{ChannelManager, ChannelStorage, RxChannel, TxChannel};
 use crate::connection::{ConnectConfig, Connection};
 use crate::connection_manager::{ConnectionManager, ConnectionStorage, PacketGrant};
 use crate::cursor::WriteCursor;
@@ -45,6 +45,9 @@ use crate::types::l2cap::{
 use crate::{attribute::AttributeTable, gatt::GattServer};
 use crate::{Address, BleHostError, Error};
 
+pub(crate) const L2CAP_TXQ: usize = 1;
+pub(crate) const L2CAP_RXQ: usize = 1;
+
 /// BleHostResources holds the resources used by the host.
 ///
 /// The packet pool is used by the host to multiplex data streams, by allocating space for
@@ -52,8 +55,10 @@ use crate::{Address, BleHostError, Error};
 pub struct BleHostResources<const CONNS: usize, const CHANNELS: usize, const PACKETS: usize, const L2CAP_MTU: usize> {
     pool: PacketPool<NoopRawMutex, L2CAP_MTU, PACKETS, CHANNELS>,
     connections: [ConnectionStorage; CONNS],
+    poll_set: [Option<ConnHandle>; CONNS],
     channels: [ChannelStorage; CHANNELS],
-    channels_rx: [RxChannel; CHANNELS],
+    channels_rx: [RxChannel<L2CAP_RXQ>; CHANNELS],
+    channels_tx: [TxChannel<L2CAP_TXQ>; CHANNELS],
     sar: [SarType; CONNS],
 }
 
@@ -65,9 +70,11 @@ impl<const CONNS: usize, const CHANNELS: usize, const PACKETS: usize, const L2CA
         Self {
             pool: PacketPool::new(qos),
             connections: [ConnectionStorage::DISCONNECTED; CONNS],
+            poll_set: [None; CONNS],
             sar: [EMPTY_SAR; CONNS],
             channels: [ChannelStorage::DISCONNECTED; CHANNELS],
-            channels_rx: [RX_CHANNEL; CHANNELS],
+            channels_rx: [RxChannel::<L2CAP_RXQ>::NEW; CHANNELS],
+            channels_tx: [TxChannel::<L2CAP_TXQ>::NEW; CHANNELS],
         }
     }
 }
@@ -88,10 +95,11 @@ pub struct BleHost<'d, T> {
     address: Option<Address>,
     initialized: OnceLock<()>,
     metrics: RefCell<Metrics>,
+    poll_set: RefCell<&'d mut [Option<ConnHandle>]>,
     pub(crate) controller: T,
     pub(crate) connections: ConnectionManager<'d>,
     pub(crate) reassembly: PacketReassembly<'d>,
-    pub(crate) channels: ChannelManager<'d>,
+    pub(crate) channels: ChannelManager<'d, L2CAP_RXQ, L2CAP_TXQ>,
     pub(crate) att_inbound: Channel<NoopRawMutex, (ConnHandle, Pdu), 1>,
     pub(crate) pool: &'static dyn GlobalPacketPool,
 
@@ -122,6 +130,7 @@ where
             address: None,
             initialized: OnceLock::new(),
             metrics: RefCell::new(Metrics::default()),
+            poll_set: RefCell::new(&mut host_resources.poll_set[..]),
             controller,
             connections: ConnectionManager::new(&mut host_resources.connections[..]),
             reassembly: PacketReassembly::new(&mut host_resources.sar[..]),
@@ -129,6 +138,7 @@ where
                 &host_resources.pool,
                 &mut host_resources.channels[..],
                 &mut host_resources.channels_rx[..],
+                &mut host_resources.channels_tx[..],
             ),
             pool: &host_resources.pool,
             att_inbound: Channel::new(),
@@ -230,6 +240,7 @@ where
         // Cancel any ongoing connection process
         let r = self.command(LeCreateConnCancel::new()).await;
         if let Ok(()) = r {
+            info!("waiting for cancellation")
             self.connections.wait_canceled().await;
         }
 
@@ -237,6 +248,7 @@ where
             return Err(Error::InvalidValue.into());
         }
 
+        info!("Setting accept filter");
         self.set_accept_filter(config.scan_config.filter_accept_list).await?;
 
         let initiating = InitiatingPhy {
@@ -250,6 +262,7 @@ where
             max_ce_len: config.connect_params.event_length.into(),
         };
         let phy_params = Self::create_phy_params(initiating, config.scan_config.phys);
+        info!("Staring create conn");
         self.async_command(LeExtCreateConn::new(
             true,
             self.address.map(|a| a.kind).unwrap_or(AddrKind::PUBLIC),
@@ -258,6 +271,7 @@ where
             phy_params,
         ))
         .await?;
+        info!("Waiting for accepting");
         let handle = self.connections.accept(config.scan_config.filter_accept_list).await;
         Ok(Connection::new(handle))
     }
@@ -728,6 +742,30 @@ where
             }
         };
         pin_mut!(control_fut);
+
+        // Task sending data to the controller
+        let tx_fut = async {
+            // Only used by us
+            let mut poll_set = self.poll_set.borrow_mut();
+            loop {
+                poll_fn(|cx| self.channels.poll_tx_ready(cx, &mut poll_set)).await;
+
+                for handle in poll_set.iter().flatten() {
+                    let grant = poll_fn(|cx| self.connections.poll_request_to_send(handle, 1, Some(cx))).await?;
+                    let acl = AclPacket::new(
+                        self.handle,
+                        AclPacketBoundary::FirstNonFlushable,
+                        AclBroadcastFlag::PointToPoint,
+                        pdu,
+                    );
+                    self.controller
+                        .write_acl_data(&acl)
+                        .await
+                        .map_err(BleHostError::Controller)?;
+                    self.grant.confirm(1);
+                }
+            }
+        };
 
         loop {
             // Task handling receiving data from the controller.
