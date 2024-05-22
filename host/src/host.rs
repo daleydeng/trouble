@@ -97,7 +97,7 @@ pub struct BleHost<'d, T> {
     pub(crate) channels: ChannelManager<'d, L2CAP_RXQ>,
     pub(crate) att_inbound: Channel<NoopRawMutex, (ConnHandle, Pdu), 1>,
     pub(crate) pool: &'static dyn GlobalPacketPool,
-    outbound: Channel<NoopRawMutex, (ConnHandle, Pdu), 1>,
+    outbound: Channel<NoopRawMutex, (ConnHandle, Pdu), 32>,
 
     pub(crate) scanner: Channel<NoopRawMutex, Option<ScanReport>, 1>,
     advertiser_terminations: Channel<NoopRawMutex, AdvHandle, 1>,
@@ -932,6 +932,11 @@ where
             handle,
             grant,
         })
+    }
+
+    pub(crate) fn try_enqueue(&self, handle: ConnHandle, pdu: Pdu) -> Result<(), Error> {
+        self.outbound.try_send((handle, pdu)).map_err(|_| Error::Busy)?;
+        Ok(())
     }
 
     /// Log status information of the host

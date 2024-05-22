@@ -366,7 +366,7 @@ impl<'a, 'd> Drop for PacketGrant<'a, 'd> {
                 }
             }
             // make it an assert?
-            warn!("[link] connection {:?} not found", self.handle);
+            warn!("[link][grant drop] connection {:?} not found", self.handle);
         }
     }
 }

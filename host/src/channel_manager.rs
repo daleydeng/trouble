@@ -132,7 +132,6 @@ impl<'d, const RXQ: usize> ChannelManager<'d, RXQ> {
             match storage.state {
                 ChannelState::PeerConnecting(_) if conn.raw() == storage.conn => {
                     storage.state = ChannelState::Disconnecting;
-                    let _ = self.inbound[idx].close();
                 }
                 ChannelState::Connecting(_) if conn.raw() == storage.conn => {
                     storage.state = ChannelState::Disconnecting;
@@ -593,21 +592,30 @@ impl<'d, const RXQ: usize> ChannelManager<'d, RXQ> {
             }
         };
 
-        let mut hci = ble.try_acl(conn, n_packets)?;
+        //let mut hci = ble.try_acl(conn, n_packets)?;
+        let mut p_buf = self
+            .pool
+            .alloc(AllocId::from_channel(cid))
+            .ok_or(BleHostError::BleHost(Error::OutOfMemory))?;
 
         // Segment using mps
         let (first, remaining) = buf.split_at(buf.len().min(mps as usize - 2));
 
-        let len = encode(first, &mut p_buf[..], peer_cid, Some(buf.len() as u16))?;
-        hci.try_send(&p_buf[..len])?;
+        let len = encode(first, p_buf.as_mut(), peer_cid, Some(buf.len() as u16))?;
+        let pdu = Pdu::new(p_buf, len);
+        ble.try_enqueue(conn, pdu)?;
         grant.confirm(1);
 
         let chunks = remaining.chunks(mps as usize);
         let num_chunks = chunks.len();
 
         for (i, chunk) in chunks.enumerate() {
-            let len = encode(chunk, &mut p_buf[..], peer_cid, None)?;
-            hci.try_send(&p_buf[..len])?;
+            let mut p_buf = self
+                .pool
+                .alloc(AllocId::from_channel(cid))
+                .ok_or(BleHostError::BleHost(Error::OutOfMemory))?;
+            let len = encode(chunk, p_buf.as_mut(), peer_cid, None)?;
+            ble.try_enqueue(conn, Pdu::new(p_buf, len))?;
             grant.confirm(1);
         }
         Ok(())
