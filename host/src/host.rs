@@ -29,7 +29,6 @@ use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::{Channel, TryReceiveError};
 use embassy_sync::once_lock::OnceLock;
-use futures::pin_mut;
 
 use crate::advertise::{Advertisement, AdvertisementParameters, AdvertisementSet, RawAdvertisement};
 use crate::channel_manager::{ChannelManager, ChannelStorage, PacketChannel};
@@ -766,6 +765,14 @@ where
         Ok(())
     }
 
+    pub fn split<'m>(&'m self) -> (BleHostControl<'m, 'd, T>, BleHostRx<'m, 'd, T>, BleHostTx<'m, 'd, T>) {
+        (
+            BleHostControl { ble: self },
+            BleHostRx { ble: self },
+            BleHostTx { ble: self },
+        )
+    }
+
     pub async fn run(&self) -> Result<(), BleHostError<T::Error>>
     where
         T: ControllerCmdSync<Disconnect>
@@ -990,12 +997,16 @@ where
             // info!("Entering select loop");
             let result: Result<(), BleHostError<T::Error>> = match select3(&mut control_fut, rx_fut, &mut tx_fut).await
             {
+//=======
+//        let (control, rx, tx) = self.split();
+//        let result: Result<(), BleHostError<T::Error>> =
+//            match select3(control.run(), rx.run(vendor_handler), tx.run()).await {
+//>>>>>>> 9f1d872 (attempt splitting tx, rx and control tasks)
                 Either3::First(result) => result,
                 Either3::Second(result) => result,
                 Either3::Third(result) => result,
             };
-            result?;
-        }
+        result
     }
 
     // Request to send n ACL packets to the HCI controller for a connection
@@ -1032,6 +1043,206 @@ where
         debug!("[host] rx errors: {}", m.rx_errors);
         self.connections.log_status();
         self.channels.log_status();
+    }
+}
+
+pub struct BleHostControl<'a, 'd, T: Controller> {
+    ble: &'a BleHost<'d, T>,
+}
+
+impl<'a, 'd, T: Controller> BleHostControl<'a, 'd, T> {
+    pub async fn run(&self) -> Result<(), BleHostError<T::Error>>
+    where
+        T: ControllerCmdSync<Disconnect>
+            + ControllerCmdSync<SetEventMask>
+            + ControllerCmdSync<LeSetEventMask>
+            + ControllerCmdSync<LeSetRandomAddr>
+            + ControllerCmdSync<HostBufferSize>
+            + ControllerCmdSync<Reset>
+            + ControllerCmdSync<LeReadBufferSize>,
+    {
+        Reset::new().exec(&self.ble.controller).await?;
+
+        if let Some(addr) = self.ble.address {
+            LeSetRandomAddr::new(addr.addr).exec(&self.ble.controller).await?;
+            info!("BleHost address set to {:?}", addr.addr);
+        }
+
+        HostBufferSize::new(
+            self.ble.rx_pool.mtu() as u16,
+            0,
+            config::L2CAP_RX_PACKET_POOL_SIZE as u16,
+            0,
+        )
+        .exec(&self.ble.controller)
+        .await?;
+
+        SetEventMask::new(
+            EventMask::new()
+                .enable_le_meta(true)
+                .enable_conn_request(true)
+                .enable_conn_complete(true)
+                .enable_hardware_error(true)
+                .enable_disconnection_complete(true),
+        )
+        .exec(&self.ble.controller)
+        .await?;
+
+        LeSetEventMask::new(
+            LeEventMask::new()
+                .enable_le_conn_complete(true)
+                .enable_le_adv_set_terminated(true)
+                .enable_le_adv_report(true)
+                .enable_le_scan_timeout(true)
+                .enable_le_ext_adv_report(true),
+        )
+        .exec(&self.ble.controller)
+        .await?;
+
+        let ret = LeReadBufferSize::new().exec(&self.ble.controller).await?;
+        info!("[host] setting txq to {}", ret.total_num_le_acl_data_packets as usize);
+        self.ble
+            .connections
+            .set_link_credits(ret.total_num_le_acl_data_packets as usize);
+        let _ = self.ble.initialized.init(());
+
+        loop {
+            let it = poll_fn(|cx| self.ble.connections.poll_disconnecting(cx)).await;
+            for entry in it {
+                self.ble.command(Disconnect::new(entry.0, entry.1)).await?;
+            }
+        }
+    }
+}
+
+pub struct BleHostTx<'a, 'd, T: Controller> {
+    ble: &'a BleHost<'d, T>,
+}
+
+impl<'a, 'd, T: Controller> BleHostTx<'a, 'd, T> {
+    pub async fn run(&self) -> Result<(), BleHostError<T::Error>> {
+        loop {
+            let (conn, pdu) = self.ble.outbound.receive().await;
+            match self.ble.acl(conn, 1).await {
+                Ok(mut sender) => {
+                    if let Err(e) = sender.send(pdu.as_ref()).await {
+                        warn!("[host] error sending outbound pdu");
+                        return Err(e);
+                    }
+                }
+                Err(e) => {
+                    warn!("[host] error requesting sending outbound pdu");
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+pub struct BleHostRx<'a, 'd, T: Controller> {
+    ble: &'a BleHost<'d, T>,
+}
+
+impl<'a, 'd, T: Controller> BleHostRx<'a, 'd, T> {
+    pub async fn run(&self, vendor_handler: Option<&dyn VendorEventHandler>) -> Result<(), BleHostError<T::Error>>
+    where
+        T: ControllerCmdSync<Disconnect>,
+    {
+        const MAX_HCI_PACKET_LEN: usize = 259;
+        loop {
+            // Task handling receiving data from the controller.
+            let mut rx = [0u8; MAX_HCI_PACKET_LEN];
+            let result = self.ble.controller.read(&mut rx).await;
+            match result {
+                Ok(ControllerToHostPacket::Acl(acl)) => match self.ble.handle_acl(acl).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        info!("Error processing ACL packet: {:?}", e);
+                        let mut m = self.ble.metrics.borrow_mut();
+                        m.rx_errors = m.rx_errors.wrapping_add(1);
+                    }
+                },
+                Ok(ControllerToHostPacket::Event(event)) => match event {
+                    Event::Le(event) => match event {
+                        LeEvent::LeConnectionComplete(e) => match e.status.to_result() {
+                            Ok(_) => {
+                                if let Err(err) = self.ble.connections.connect(e.handle, &e) {
+                                    warn!("Error establishing connection: {:?}", err);
+                                    let _ = self
+                                        .ble
+                                        .command(Disconnect::new(
+                                            e.handle,
+                                            DisconnectReason::RemoteDeviceTerminatedConnLowResources,
+                                        ))
+                                        .await;
+                                } else {
+                                    let mut m = self.ble.metrics.borrow_mut();
+                                    m.connect_events = m.connect_events.wrapping_add(1);
+                                }
+                            }
+                            Err(bt_hci::param::Error::UNKNOWN_CONN_IDENTIFIER) => {
+                                self.ble.connections.canceled();
+                            }
+                            Err(e) => {
+                                warn!("Error connection complete");
+                                warn!("Error connection complete event: {:?}", e);
+                            }
+                        },
+                        LeEvent::LeScanTimeout(_) => {
+                            self.ble.scanner.send(None).await;
+                        }
+                        LeEvent::LeAdvertisingSetTerminated(set) => {
+                            self.ble.advertiser_terminations.send(set.adv_handle).await;
+                        }
+                        LeEvent::LeExtendedAdvertisingReport(data) => {
+                            self.ble
+                                .scanner
+                                .send(Some(ScanReport::new(data.reports.num_reports, &data.reports.bytes)))
+                                .await;
+                        }
+                        LeEvent::LeAdvertisingReport(data) => {
+                            self.ble
+                                .scanner
+                                .send(Some(ScanReport::new(data.reports.num_reports, &data.reports.bytes)))
+                                .await;
+                        }
+                        _ => {
+                            warn!("Unknown LE event!");
+                        }
+                    },
+                    Event::DisconnectionComplete(e) => {
+                        let handle = e.handle;
+                        let _ = self.ble.connections.disconnect(handle);
+                        let _ = self.ble.channels.disconnected(handle);
+                        self.ble.reassembly.disconnected(handle);
+                        let mut m = self.ble.metrics.borrow_mut();
+                        m.disconnect_events = m.disconnect_events.wrapping_add(1);
+                    }
+                    Event::NumberOfCompletedPackets(c) => {
+                        // Explicitly ignoring for now
+                        for entry in c.completed_packets.iter() {
+                            if let (Ok(handle), Ok(completed)) = (entry.handle(), entry.num_completed_packets()) {
+                                let _ = self.ble.connections.confirm_sent(handle, completed as usize);
+                            }
+                        }
+                    }
+                    Event::Vendor(vendor) => {
+                        if let Some(handler) = vendor_handler {
+                            handler.on_event(&vendor);
+                        }
+                    }
+                    _ => {
+                        warn!("Unknown event");
+                    }
+                },
+                Ok(p) => {
+                    warn!("Ignoring packet: {:?}", p);
+                }
+                Err(e) => {
+                    return Err(BleHostError::Controller(e));
+                }
+            }
+        }
     }
 }
 
