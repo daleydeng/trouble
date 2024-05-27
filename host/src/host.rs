@@ -809,199 +809,9 @@ where
             //            + ControllerCmdSync<LeReadNumberOfSupportedAdvSets>
             + ControllerCmdSync<LeReadBufferSize>,
     {
-        const MAX_HCI_PACKET_LEN: usize = 259;
-
-        // Control future that initializes system and handles controller changes.
-        let control_fut = async {
-            Reset::new().exec(&self.controller).await?;
-
-            if let Some(addr) = self.address {
-                LeSetRandomAddr::new(addr.addr).exec(&self.controller).await?;
-                info!("BleHost address set to {:?}", addr.addr);
-            }
-
-            HostBufferSize::new(
-                self.rx_pool.mtu() as u16,
-                0,
-                config::L2CAP_RX_PACKET_POOL_SIZE as u16,
-                0,
-            )
-            .exec(&self.controller)
-            .await?;
-
-            SetEventMask::new(
-                EventMask::new()
-                    .enable_le_meta(true)
-                    .enable_conn_request(true)
-                    .enable_conn_complete(true)
-                    .enable_hardware_error(true)
-                    .enable_disconnection_complete(true),
-            )
-            .exec(&self.controller)
-            .await?;
-
-            LeSetEventMask::new(
-                LeEventMask::new()
-                    .enable_le_conn_complete(true)
-                    .enable_le_enhanced_conn_complete(true)
-                    //                    .enable_le_conn_update_complete(true)
-                    //                    .enable_le_conn_iq_report(true)
-                    //                    .enable_le_transmit_power_reporting(true)
-                    //                    .enable_le_enhanced_conn_complete_v2(true)
-                    .enable_le_adv_set_terminated(true)
-                    .enable_le_adv_report(true)
-                    .enable_le_scan_timeout(true)
-                    .enable_le_ext_adv_report(true),
-            )
-            .exec(&self.controller)
-            .await?;
-
-            let ret = LeReadBufferSize::new().exec(&self.controller).await?;
-            info!("[host] setting txq to {}", ret.total_num_le_acl_data_packets as usize);
-            self.connections
-                .set_link_credits(ret.total_num_le_acl_data_packets as usize);
-            // TODO: Configure ACL max buffer size as well?
-            let _ = self.initialized.init(());
-
-            loop {
-                match select3(
-                    poll_fn(|cx| self.connections.poll_disconnecting(cx)),
-                    poll_fn(|cx| self.connect_state.poll_cancelled(cx)),
-                    poll_fn(|cx| self.advertise_state.poll_cancelled(cx)),
-                )
-                .await
-                {
-                    Either3::First(it) => {
-                        for entry in it {
-                            self.command(Disconnect::new(entry.0, entry.1)).await?;
-                        }
-                    }
-                    Either3::Second(_) => {
-                        if let Err(e) = self.command(LeCreateConnCancel::new()).await {
-                            // Signal to ensure no one is stuck
-                            self.connect_state.canceled();
-                        }
-                    }
-                    Either3::Third(ext) => {
-                        if ext {
-                            self.command(LeSetExtAdvEnable::new(false, &[])).await?
-                        } else {
-                            self.command(LeSetAdvEnable::new(false)).await?
-                        }
-                        self.advertise_state.canceled();
-                    }
-                }
-            }
-        };
-        pin_mut!(control_fut);
-
-        let tx_fut = async {
-            loop {
-                let (conn, pdu) = self.outbound.receive().await;
-                match self.acl(conn, 1).await {
-                    Ok(mut sender) => {
-                        if let Err(e) = sender.send(pdu.as_ref()).await {
-                            warn!("[host] error sending outbound pdu");
-                            return Err(e);
-                        }
-                    }
-                    Err(e) => {
-                        warn!("[host] error requesting sending outbound pdu");
-                        return Err(e);
-                    }
-                }
-            }
-        };
-        pin_mut!(tx_fut);
-
-        loop {
-            // Task handling receiving data from the controller.
-            let rx_fut = async {
-                let mut rx = [0u8; MAX_HCI_PACKET_LEN];
-                let result = self.controller.read(&mut rx).await;
-                match result {
-                    Ok(ControllerToHostPacket::Acl(acl)) => match self.handle_acl(acl).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            info!("Error processing ACL packet: {:?}", e);
-                            let mut m = self.metrics.borrow_mut();
-                            m.rx_errors = m.rx_errors.wrapping_add(1);
-                        }
-                    },
-                    Ok(ControllerToHostPacket::Event(event)) => match event {
-                        Event::Le(event) => match event {
-                            LeEvent::LeConnectionComplete(e) => {
-                                self.handle_connection(e.status, e.handle, e.peer_addr_kind, e.peer_addr, e.role)
-                                    .await;
-                            }
-                            LeEvent::LeEnhancedConnectionComplete(e) => {
-                                self.handle_connection(e.status, e.handle, e.peer_addr_kind, e.peer_addr, e.role)
-                                    .await;
-                            }
-                            LeEvent::LeScanTimeout(_) => {
-                                self.scanner.send(None).await;
-                            }
-                            LeEvent::LeAdvertisingSetTerminated(set) => {
-                                self.advertise_terminated.send(Some(set.adv_handle)).await;
-                            }
-                            LeEvent::LeExtendedAdvertisingReport(data) => {
-                                self.scanner
-                                    .send(Some(ScanReport::new(data.reports.num_reports, &data.reports.bytes)))
-                                    .await;
-                            }
-                            LeEvent::LeAdvertisingReport(data) => {
-                                self.scanner
-                                    .send(Some(ScanReport::new(data.reports.num_reports, &data.reports.bytes)))
-                                    .await;
-                            }
-                            _ => {
-                                warn!("Unknown LE event!");
-                            }
-                        },
-                        Event::DisconnectionComplete(e) => {
-                            let handle = e.handle;
-                            info!("Disconnection event from {}", handle.raw());
-                            let _ = self.connections.disconnect(handle);
-                            let _ = self.channels.disconnected(handle);
-                            self.reassembly.disconnected(handle);
-                            let mut m = self.metrics.borrow_mut();
-                            m.disconnect_events = m.disconnect_events.wrapping_add(1);
-                        }
-                        Event::NumberOfCompletedPackets(c) => {
-                            // Explicitly ignoring for now
-                            for entry in c.completed_packets.iter() {
-                                if let (Ok(handle), Ok(completed)) = (entry.handle(), entry.num_completed_packets()) {
-                                    let _ = self.connections.confirm_sent(handle, completed as usize);
-                                }
-                            }
-                        }
-                        Event::Vendor(vendor) => {
-                            if let Some(handler) = vendor_handler {
-                                handler.on_event(&vendor);
-                            }
-                        }
-                        _ => {
-                            warn!("Unknown event");
-                        }
-                    },
-                    Ok(p) => {
-                        warn!("Ignoring packet: {:?}", p);
-                    }
-                    Err(e) => {
-                        return Err(BleHostError::Controller(e));
-                    }
-                }
-                Ok(())
-            };
-
-            // info!("Entering select loop");
-            let result: Result<(), BleHostError<T::Error>> = match select3(&mut control_fut, rx_fut, &mut tx_fut).await
-            {
-//=======
-//        let (control, rx, tx) = self.split();
-//        let result: Result<(), BleHostError<T::Error>> =
-//            match select3(control.run(), rx.run(vendor_handler), tx.run()).await {
-//>>>>>>> 9f1d872 (attempt splitting tx, rx and control tasks)
+        let (control, rx, tx) = self.split();
+        let result: Result<(), BleHostError<T::Error>> =
+            match select3(control.run(), rx.run(vendor_handler), tx.run()).await {
                 Either3::First(result) => result,
                 Either3::Second(result) => result,
                 Either3::Third(result) => result,
@@ -1057,6 +867,9 @@ impl<'a, 'd, T: Controller> BleHostControl<'a, 'd, T> {
             + ControllerCmdSync<SetEventMask>
             + ControllerCmdSync<LeSetEventMask>
             + ControllerCmdSync<LeSetRandomAddr>
+            + for<'t> ControllerCmdSync<LeSetAdvEnable>
+            + for<'t> ControllerCmdSync<LeSetExtAdvEnable<'t>>
+            + ControllerCmdSync<LeCreateConnCancel>
             + ControllerCmdSync<HostBufferSize>
             + ControllerCmdSync<Reset>
             + ControllerCmdSync<LeReadBufferSize>,
@@ -1091,6 +904,11 @@ impl<'a, 'd, T: Controller> BleHostControl<'a, 'd, T> {
         LeSetEventMask::new(
             LeEventMask::new()
                 .enable_le_conn_complete(true)
+                .enable_le_enhanced_conn_complete(true)
+                //                    .enable_le_conn_update_complete(true)
+                //                    .enable_le_conn_iq_report(true)
+                //                    .enable_le_transmit_power_reporting(true)
+                //                    .enable_le_enhanced_conn_complete_v2(true)
                 .enable_le_adv_set_terminated(true)
                 .enable_le_adv_report(true)
                 .enable_le_scan_timeout(true)
@@ -1104,12 +922,36 @@ impl<'a, 'd, T: Controller> BleHostControl<'a, 'd, T> {
         self.ble
             .connections
             .set_link_credits(ret.total_num_le_acl_data_packets as usize);
+        // TODO: Configure ACL max buffer size as well?
         let _ = self.ble.initialized.init(());
 
         loop {
-            let it = poll_fn(|cx| self.ble.connections.poll_disconnecting(cx)).await;
-            for entry in it {
-                self.ble.command(Disconnect::new(entry.0, entry.1)).await?;
+            match select3(
+                poll_fn(|cx| self.ble.connections.poll_disconnecting(cx)),
+                poll_fn(|cx| self.ble.connect_state.poll_cancelled(cx)),
+                poll_fn(|cx| self.ble.advertise_state.poll_cancelled(cx)),
+            )
+            .await
+            {
+                Either3::First(it) => {
+                    for entry in it {
+                        self.ble.command(Disconnect::new(entry.0, entry.1)).await?;
+                    }
+                }
+                Either3::Second(_) => {
+                    if let Err(e) = self.ble.command(LeCreateConnCancel::new()).await {
+                        // Signal to ensure no one is stuck
+                        self.ble.connect_state.canceled();
+                    }
+                }
+                Either3::Third(ext) => {
+                    if ext {
+                        self.ble.command(LeSetExtAdvEnable::new(false, &[])).await?
+                    } else {
+                        self.ble.command(LeSetAdvEnable::new(false)).await?
+                    }
+                    self.ble.advertise_state.canceled();
+                }
             }
         }
     }
@@ -1164,35 +1006,21 @@ impl<'a, 'd, T: Controller> BleHostRx<'a, 'd, T> {
                 },
                 Ok(ControllerToHostPacket::Event(event)) => match event {
                     Event::Le(event) => match event {
-                        LeEvent::LeConnectionComplete(e) => match e.status.to_result() {
-                            Ok(_) => {
-                                if let Err(err) = self.ble.connections.connect(e.handle, &e) {
-                                    warn!("Error establishing connection: {:?}", err);
-                                    let _ = self
-                                        .ble
-                                        .command(Disconnect::new(
-                                            e.handle,
-                                            DisconnectReason::RemoteDeviceTerminatedConnLowResources,
-                                        ))
-                                        .await;
-                                } else {
-                                    let mut m = self.ble.metrics.borrow_mut();
-                                    m.connect_events = m.connect_events.wrapping_add(1);
-                                }
-                            }
-                            Err(bt_hci::param::Error::UNKNOWN_CONN_IDENTIFIER) => {
-                                self.ble.connections.canceled();
-                            }
-                            Err(e) => {
-                                warn!("Error connection complete");
-                                warn!("Error connection complete event: {:?}", e);
-                            }
-                        },
+                        LeEvent::LeConnectionComplete(e) => {
+                            self.ble
+                                .handle_connection(e.status, e.handle, e.peer_addr_kind, e.peer_addr, e.role)
+                                .await;
+                        }
+                        LeEvent::LeEnhancedConnectionComplete(e) => {
+                            self.ble
+                                .handle_connection(e.status, e.handle, e.peer_addr_kind, e.peer_addr, e.role)
+                                .await;
+                        }
                         LeEvent::LeScanTimeout(_) => {
                             self.ble.scanner.send(None).await;
                         }
                         LeEvent::LeAdvertisingSetTerminated(set) => {
-                            self.ble.advertiser_terminations.send(set.adv_handle).await;
+                            self.ble.advertise_terminated.send(Some(set.adv_handle)).await;
                         }
                         LeEvent::LeExtendedAdvertisingReport(data) => {
                             self.ble
@@ -1212,6 +1040,7 @@ impl<'a, 'd, T: Controller> BleHostRx<'a, 'd, T> {
                     },
                     Event::DisconnectionComplete(e) => {
                         let handle = e.handle;
+                        info!("Disconnection event from {}", handle.raw());
                         let _ = self.ble.connections.disconnect(handle);
                         let _ = self.ble.channels.disconnected(handle);
                         self.ble.reassembly.disconnected(handle);
