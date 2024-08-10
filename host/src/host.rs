@@ -948,14 +948,20 @@ where
                 LeSetRandomAddr::new(addr.addr).exec(&self.controller).await?;
             }
 
-            HostBufferSize::new(
+            let res = HostBufferSize::new(
                 self.rx_pool.mtu() as u16,
                 0,
                 config::L2CAP_RX_PACKET_POOL_SIZE as u16,
                 0,
             )
             .exec(&self.controller)
-            .await?;
+            .await;
+
+            match res {
+                Ok(_) => {},
+                Err(bt_hci::cmd::Error::Hci(bt_hci::param::Error::UNSUPPORTED)) => {},
+                Err(e) => {return Err(e.into());}
+            }
 
             SetEventMask::new(
                 EventMask::new()
